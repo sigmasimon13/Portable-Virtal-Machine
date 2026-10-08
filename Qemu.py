@@ -21,17 +21,51 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QIcon, QAction, QFont
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem,
+    QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QAbstractItemView,
     QHBoxLayout, QVBoxLayout, QFormLayout, QLabel, QPushButton, QLineEdit,
     QSpinBox, QComboBox, QFileDialog, QToolBar, QSplitter, QMessageBox,
-    QDialog, QDialogButtonBox, QGroupBox, QCheckBox, QStyle
+    QDialog, QDialogButtonBox, QGroupBox, QCheckBox, QStyle, QPlainTextEdit,
+    QTabWidget
 )
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-QEMU_DIR = Path(r"C:\qemu-portable-20241220")
+def _default_qemu_dir() -> Path:
+    """
+    Figure out where the portable QEMU folder should be.
+
+    Priority:
+      1. QEMU_DIR environment variable, if set.
+      2. A "qemu-portable" folder bundled next to this exe/script
+         (this is where --add-data lands when frozen with PyInstaller,
+         or where you'd manually copy the folder in dev/onedir builds).
+      3. Fallback hardcoded default (old behavior).
+    """
+    env_override = os.environ.get("QEMU_DIR")
+    if env_override:
+        return Path(env_override)
+
+    if getattr(sys, "frozen", False):
+        # Running as a PyInstaller exe.
+        # onefile: bundled data extracted to sys._MEIPASS at runtime.
+        # onedir: everything sits next to the exe itself.
+        base_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        exe_dir = Path(sys.executable).parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+        exe_dir = base_dir
+
+    for candidate_root in (base_dir, exe_dir):
+        candidate = candidate_root / "qemu-portable"
+        if candidate.exists():
+            return candidate
+
+    return Path(r"C:\qemu-portable-20241220")
+
+
+QEMU_DIR = _default_qemu_dir()
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "QemuManager"
 CONFIG_FILE = CONFIG_DIR / "vms.json"
 VM_DISK_DIR = CONFIG_DIR / "disks"
@@ -70,14 +104,233 @@ try:
 except Exception as _e:
     print(f"[QEMU Manager] Could not run --version on {QEMU_SYSTEM}: {_e}")
 
-ACCEL_OPTIONS = ["whpx", "haxm", "tcg (no acceleration)"]
+def _detect_usb_drive_letters():
+    """
+    Windows only. Returns {(vendor_id, product_id): (drive_letter, model)}
+    for USB disks that currently have an assigned drive letter, by walking
+    LogicalDisk -> Partition -> DiskDrive and pulling the VID/PID from the
+    disk's parent USB device entry (PNPDeviceID on the storage node doesn't
+    contain a VID/PID, so this looks up the matching parent USB\\VID_ node
+    by matching the shared serial number).
+    """
+    ps_cmd = r"""
+$results = @()
+Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" | ForEach-Object {
+    $ld = $_
+    $partition = Get-CimAssociatedInstance -InputObject $ld -ResultClassName Win32_DiskPartition -ErrorAction SilentlyContinue
+    if ($partition) {
+        $disk = Get-CimAssociatedInstance -InputObject $partition -ResultClassName Win32_DiskDrive -ErrorAction SilentlyContinue
+        if ($disk) {
+            $results += "$($ld.DeviceID)||$($disk.Model)||$($disk.PNPDeviceID)"
+        }
+    }
+}
+$results
+"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        # Pull all USB parent nodes once so we can match by serial number.
+        usb_out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\\VID_*' } "
+             "| Select-Object -ExpandProperty InstanceId"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        usb_instance_ids = [l.strip() for l in usb_out.splitlines() if l.strip().startswith("USB\\VID_")]
+
+        drive_map = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if "||" not in line:
+                continue
+            parts = line.split("||")
+            if len(parts) != 3:
+                continue
+            device_id, model, pnp_id = parts
+            letter = device_id.rstrip(":")
+            # The storage PNPDeviceID ends in the drive's serial number after
+            # the last backslash; USB parent nodes share that same serial.
+            serial = pnp_id.rsplit("\\", 1)[-1].split("&")[0]
+            if not serial:
+                continue
+            for instance_id in usb_instance_ids:
+                if serial and serial in instance_id:
+                    try:
+                        vid_part, pid_part = instance_id.split("&PID_", 1)
+                        vendor_id = vid_part.split("VID_", 1)[1][:4].lower()
+                        product_id = pid_part[:4].lower()
+                    except (IndexError, ValueError):
+                        continue
+                    drive_map[(vendor_id, product_id)] = (letter, model.strip())
+                    break
+        return drive_map
+    except Exception as e:
+        print(f"[QEMU Manager] Drive-letter detection failed: {e}")
+        return {}
+
+
+def detect_usb_devices():
+    """
+    Return a list of (vendor_id, product_id, description) tuples for
+    currently connected USB devices, using whatever mechanism is available
+    on the host OS. Best-effort — returns [] if detection fails.
+    """
+    devices = []
+    try:
+        if sys.platform.startswith("linux") or sys.platform == "darwin":
+            out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5).stdout
+            # Example line: "Bus 001 Device 003: ID 046d:c52b Logitech, Inc. Unifying Receiver"
+            for line in out.splitlines():
+                parts = line.split("ID ", 1)
+                if len(parts) != 2:
+                    continue
+                rest = parts[1].strip()
+                ids, _, desc = rest.partition(" ")
+                if ":" not in ids:
+                    continue
+                vendor_id, _, product_id = ids.partition(":")
+                devices.append((vendor_id, product_id, desc.strip() or ids))
+        else:
+            # Windows: query PnP devices via PowerShell, get both the instance id
+            # (for VID/PID) and the friendly device name.
+            ps_cmd = (
+                "Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\\VID_*' } "
+                "| Select-Object InstanceId, FriendlyName "
+                "| ForEach-Object { \"$($_.InstanceId)||$($_.FriendlyName)\" }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            seen = set()
+            for line in out.splitlines():
+                line = line.strip()
+                if not line.startswith("USB\\VID_") or "||" not in line:
+                    continue
+                instance_id, _, friendly_name = line.partition("||")
+                try:
+                    vid_part, pid_part = instance_id.split("&PID_", 1)
+                    vendor_id = vid_part.split("VID_", 1)[1][:4]
+                    product_id = pid_part[:4]
+                except (IndexError, ValueError):
+                    continue
+                key = (vendor_id.lower(), product_id.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                devices.append((vendor_id.lower(), product_id.lower(), friendly_name.strip() or instance_id))
+
+            # Map USB storage devices to their drive letter + model, so
+            # flash drives/external disks are identifiable at a glance
+            # instead of showing up as generic "USB Mass Storage Device".
+            drive_map = _detect_usb_drive_letters()
+            if drive_map:
+                labeled = []
+                for vendor_id, product_id, name in devices:
+                    match = drive_map.get((vendor_id.lower(), product_id.lower()))
+                    if match:
+                        letter, model = match
+                        labeled.append((vendor_id, product_id, f"{letter}: — {model}"))
+                    else:
+                        labeled.append((vendor_id, product_id, name))
+                devices = labeled
+    except Exception as e:
+        print(f"[QEMU Manager] USB detection failed: {e}")
+    return devices
+
+
+if sys.platform.startswith("linux"):
+    ACCEL_OPTIONS = ["kvm", "tcg", "haxm"]
+    _DEFAULT_CPU_MODEL = "host"
+elif sys.platform == "darwin":
+    ACCEL_OPTIONS = ["hvf", "tcg", "haxm"]
+    _DEFAULT_CPU_MODEL = "host"
+else:
+    # Windows: WHPX has known interrupt-injection issues with q35 on some
+    # builds, so default to the slower but reliable tcg backend, and to
+    # the "max" CPU model since "host" requires a working accelerator.
+    ACCEL_OPTIONS = ["tcg", "whpx", "haxm"]
+    _DEFAULT_CPU_MODEL = "max"
 OS_TYPES = ["Windows", "Linux", "Other"]
 MACHINE_OPTIONS = ["q35", "pc"]
-CPU_OPTIONS = ["qemu64", "max"]
+CPU_OPTIONS = [
+    "qemu64",
+    "max",
+    "host",
+    "kvm64",
+    "kvm32",
+    "qemu32",
+    "486",
+    "pentium",
+    "pentium2",
+    "pentium3",
+    "athlon",
+    "phenom",
+    "core2duo",
+    "coreduo",
+    "n270",
+    "Conroe",
+    "Penryn",
+    "Nehalem",
+    "Nehalem-IBRS",
+    "Westmere",
+    "Westmere-IBRS",
+    "SandyBridge",
+    "SandyBridge-IBRS",
+    "IvyBridge",
+    "IvyBridge-IBRS",
+    "Haswell",
+    "Haswell-noTSX",
+    "Haswell-IBRS",
+    "Haswell-noTSX-IBRS",
+    "Broadwell",
+    "Broadwell-noTSX",
+    "Broadwell-IBRS",
+    "Broadwell-noTSX-IBRS",
+    "Skylake-Client",
+    "Skylake-Client-IBRS",
+    "Skylake-Client-noTSX-IBRS",
+    "Skylake-Server",
+    "Skylake-Server-IBRS",
+    "Skylake-Server-noTSX-IBRS",
+    "Cascadelake-Server",
+    "Cascadelake-Server-noTSX",
+    "Cooperlake",
+    "Icelake-Client",
+    "Icelake-Client-noTSX",
+    "Icelake-Server",
+    "Icelake-Server-noTSX",
+    "SapphireRapids",
+    "Denverton",
+    "Snowridge",
+    "KnightsMill",
+    "Dhyana",
+    "EPYC",
+    "EPYC-IBPB",
+    "EPYC-Rome",
+    "EPYC-Milan",
+    "EPYC-Genoa",
+    "Opteron_G1",
+    "Opteron_G2",
+    "Opteron_G3",
+    "Opteron_G4",
+    "Opteron_G5",
+    "athlon64",
+]
 DISPLAY_OPTIONS = ["gtk", "sdl", "none"]
 VGA_OPTIONS = ["std", "virtio-vga", "qxl", "vmware"]
 DISK_FORMATS = ["qcow2", "raw"]
 DISK_BUS_OPTIONS = ["virtio", "sata"]
+NETWORK_MODES = ["user", "bridge", "none"]
+NETWORK_MODE_LABELS = {
+    "user": "NAT (user networking)",
+    "bridge": "Bridged adapter",
+    "none": "Disabled",
+}
+NETWORK_MODELS = ["virtio", "e1000", "rtl8139", "vmxnet3"]
 
 
 # ---------------------------------------------------------------------------
@@ -102,19 +355,27 @@ def default_vm(name="New Virtual Machine") -> dict:
         "id": str(uuid.uuid4()),
         "name": name,
         "os_type": "Windows",
-        "ram_mb": 2048,
-        "cpus": 1,
+        "ram_mb": 6144,
+        "cpus": 2,
         "disk_path": "",
-        "disk_size_gb": 40,
+        "disk_size_gb": 60,
         "iso_path": "",
         "accel": ACCEL_OPTIONS[0],
         "network": True,
+        "network_mode": "user",
+        "network_model": "virtio",
+        "network_mac": "",
+        "network_ipv6": True,
+        "network_dns": "",
+        "network_bridge": "",
+        "network_hostfwd": "",
         "machine": "q35",
-        "cpu_model": "qemu64",
+        "cpu_model": _DEFAULT_CPU_MODEL,
         "display": "gtk",
         "vga": "std",
         "disk_format": "qcow2",
         "disk_bus": "virtio",
+        "usb_devices": [],  # list of "vendor_id:product_id" strings, e.g. "046d:c52b"
     }
 
 
@@ -213,6 +474,13 @@ class MainWindow(QMainWindow):
             vm.setdefault("vga", "std")
             vm.setdefault("disk_format", "qcow2")
             vm.setdefault("disk_bus", "virtio")
+            vm.setdefault("network_mode", "user" if vm.get("network", True) else "none")
+            vm.setdefault("network_model", "virtio")
+            vm.setdefault("network_mac", "")
+            vm.setdefault("network_ipv6", True)
+            vm.setdefault("network_dns", "")
+            vm.setdefault("network_bridge", "")
+            vm.setdefault("network_hostfwd", "")
         self.current_vm_id = None
         self.processes = {}
 
@@ -272,6 +540,9 @@ class MainWindow(QMainWindow):
         f.setBold(True)
         self.title_label.setFont(f)
         self.details_layout.addWidget(self.title_label)
+        self.subtitle_label = QLabel("Virtual machine overview")
+        self.subtitle_label.setStyleSheet("color: #718096; font-size: 12px;")
+        self.details_layout.addWidget(self.subtitle_label)
 
         self.info_group = QGroupBox("General")
         info_form = QFormLayout(self.info_group)
@@ -281,11 +552,14 @@ class MainWindow(QMainWindow):
         self.info_disk = QLabel("-")
         self.info_iso = QLabel("-")
         self.info_iso.setWordWrap(True)
+        self.info_network = QLabel("-")
+        self.info_network.setWordWrap(True)
         info_form.addRow("Type:", self.info_os)
         info_form.addRow("RAM:", self.info_ram)
         info_form.addRow("Processors:", self.info_cpu)
         info_form.addRow("Disk:", self.info_disk)
         info_form.addRow("ISO:", self.info_iso)
+        info_form.addRow("Network:", self.info_network)
         self.details_layout.addWidget(self.info_group)
 
         self.details_layout.addStretch()
@@ -320,11 +594,13 @@ class MainWindow(QMainWindow):
         if current is None:
             self.current_vm_id = None
             self.title_label.setText("No machine selected")
+            self.subtitle_label.setText("Select a machine from the list")
             self.info_os.setText("-")
             self.info_ram.setText("-")
             self.info_cpu.setText("-")
             self.info_disk.setText("-")
             self.info_iso.setText("-")
+            self.info_network.setText("-")
             return
         vm_id = current.data(Qt.UserRole)
         self.current_vm_id = vm_id
@@ -332,11 +608,23 @@ class MainWindow(QMainWindow):
         if not vm:
             return
         self.title_label.setText(vm["name"])
+        self.subtitle_label.setText("Ready to start · Double-click a machine to launch it")
         self.info_os.setText(vm["os_type"])
         self.info_ram.setText(f'{vm["ram_mb"]} MB')
         self.info_cpu.setText(str(vm["cpus"]))
         self.info_disk.setText(f'{vm["disk_path"] or "(no disk)"}  ({vm["disk_size_gb"]} GB)')
         self.info_iso.setText(vm["iso_path"] or "(none)")
+        network_mode = vm.get("network_mode", "user" if vm.get("network", True) else "none")
+        network_text = NETWORK_MODE_LABELS.get(network_mode, network_mode)
+        if network_mode != "none":
+            network_text += f" · {vm.get('network_model', 'virtio')}"
+            forwards = [
+                line.strip() for line in vm.get("network_hostfwd", "").splitlines()
+                if line.strip()
+            ]
+            if forwards:
+                network_text += f" · {len(forwards)} port forward(s)"
+        self.info_network.setText(network_text)
 
     def new_vm(self):
         dlg = NewVMDialog(self)
@@ -513,9 +801,51 @@ class MainWindow(QMainWindow):
             args += ["-accel", "whpx,kernel-irqchip=off"]
         elif accel.startswith("haxm"):
             args += ["-accel", "hax"]
+        elif accel.startswith("kvm"):
+            args += ["-accel", "kvm"]
+        elif accel.startswith("hvf"):
+            args += ["-accel", "hvf"]
 
-        if vm.get("network", True):
-            args += ["-nic", "user,model=virtio"]
+        network_mode = vm.get("network_mode", "user" if vm.get("network", True) else "none")
+        if network_mode == "none":
+            args += ["-nic", "none"]
+        else:
+            nic_options = [network_mode, f'model={vm.get("network_model", "virtio")}']
+            mac = vm.get("network_mac", "").strip()
+            if mac:
+                nic_options.append(f"mac={mac}")
+            if network_mode == "user":
+                nic_options.append(f'ipv6={"on" if vm.get("network_ipv6", True) else "off"}')
+                dns = vm.get("network_dns", "").strip()
+                if dns:
+                    nic_options.append(f"dns={dns}")
+                for forwarding in vm.get("network_hostfwd", "").splitlines():
+                    forwarding = forwarding.strip()
+                    if forwarding:
+                        nic_options.append(f"hostfwd={forwarding}")
+            elif network_mode == "bridge":
+                bridge = vm.get("network_bridge", "").strip()
+                if not bridge:
+                    QMessageBox.critical(
+                        self, "Missing bridge name",
+                        "Bridged networking requires a bridge name or interface."
+                    )
+                    return
+                nic_options.append(f"br={bridge}")
+            args += ["-nic", ",".join(nic_options)]
+
+        usb_devices = vm.get("usb_devices", [])
+        if usb_devices:
+            args += ["-usb", "-device", "qemu-xhci,id=xhci"]
+            for dev_id in usb_devices:
+                try:
+                    vendor_id, product_id = dev_id.split(":")
+                    int(vendor_id, 16)
+                    int(product_id, 16)
+                except ValueError:
+                    print(f"[QEMU Manager] Skipping invalid USB device id: {dev_id!r}")
+                    continue
+                args += ["-device", f"usb-host,vendorid=0x{vendor_id},productid=0x{product_id}"]
 
         try:
             print_command(args, label=f'qemu-system-x86_64 ({vm["name"]})')
@@ -534,9 +864,23 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.vm = vm
         self.setWindowTitle(f'Settings - {vm["name"]}')
-        self.setMinimumWidth(480)
+        self.setMinimumSize(560, 420)
+        self.resize(620, 520)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        general_page = QWidget()
+        general_layout = QVBoxLayout(general_page)
+        system_page = QWidget()
+        system_layout = QVBoxLayout(system_page)
+        storage_page = QWidget()
+        storage_layout = QVBoxLayout(storage_page)
+        network_page = QWidget()
+        network_layout = QVBoxLayout(network_page)
+        usb_page = QWidget()
+        usb_layout = QVBoxLayout(usb_page)
 
         general_box = QGroupBox("General")
         general_form = QFormLayout(general_box)
@@ -546,7 +890,7 @@ class SettingsDialog(QDialog):
         self.os_combo.addItems(OS_TYPES)
         self.os_combo.setCurrentText(vm["os_type"])
         general_form.addRow("Type:", self.os_combo)
-        layout.addWidget(general_box)
+        general_layout.addWidget(general_box)
 
         system_box = QGroupBox("System")
         system_form = QFormLayout(system_box)
@@ -586,7 +930,7 @@ class SettingsDialog(QDialog):
         self.vga_combo.addItems(VGA_OPTIONS)
         self.vga_combo.setCurrentText(vm.get("vga", "std"))
         system_form.addRow("Video device:", self.vga_combo)
-        layout.addWidget(system_box)
+        system_layout.addWidget(system_box)
 
         storage_box = QGroupBox("Storage")
         storage_form = QFormLayout(storage_box)
@@ -626,14 +970,103 @@ class SettingsDialog(QDialog):
         iso_row.addWidget(iso_clear)
         storage_form.addRow("ISO image:", iso_row)
 
-        layout.addWidget(storage_box)
+        storage_layout.addWidget(storage_box)
 
         network_box = QGroupBox("Network")
         network_form = QFormLayout(network_box)
-        self.network_check = QCheckBox("Enable NAT network adapter")
-        self.network_check.setChecked(vm.get("network", True))
-        network_form.addRow(self.network_check)
-        layout.addWidget(network_box)
+        self.network_mode_combo = QComboBox()
+        for mode in NETWORK_MODES:
+            self.network_mode_combo.addItem(NETWORK_MODE_LABELS[mode], mode)
+        saved_mode = vm.get("network_mode", "user" if vm.get("network", True) else "none")
+        self.network_mode_combo.setCurrentIndex(max(0, self.network_mode_combo.findData(saved_mode)))
+        self.network_mode_combo.currentIndexChanged.connect(self._update_network_fields)
+        network_form.addRow("Connection:", self.network_mode_combo)
+
+        self.network_model_combo = QComboBox()
+        self.network_model_combo.addItems(NETWORK_MODELS)
+        self.network_model_combo.setCurrentText(vm.get("network_model", "virtio"))
+        network_form.addRow("Adapter model:", self.network_model_combo)
+
+        self.network_mac_edit = QLineEdit(vm.get("network_mac", ""))
+        self.network_mac_edit.setPlaceholderText("Auto-generated (or e.g. 52:54:00:12:34:56)")
+        network_form.addRow("MAC address:", self.network_mac_edit)
+
+        self.network_ipv6_check = QCheckBox("Enable IPv6")
+        self.network_ipv6_check.setChecked(vm.get("network_ipv6", True))
+        network_form.addRow("", self.network_ipv6_check)
+
+        self.network_dns_edit = QLineEdit(vm.get("network_dns", ""))
+        self.network_dns_edit.setPlaceholderText("Optional DNS server, e.g. 1.1.1.1")
+        network_form.addRow("DNS server:", self.network_dns_edit)
+
+        self.network_bridge_edit = QLineEdit(vm.get("network_bridge", ""))
+        self.network_bridge_edit.setPlaceholderText("Windows bridge name or interface")
+        network_form.addRow("Bridge name:", self.network_bridge_edit)
+
+        self.network_hostfwd_edit = QPlainTextEdit(vm.get("network_hostfwd", ""))
+        self.network_hostfwd_edit.setPlaceholderText(
+            "One rule per line, for example:\n"
+            "tcp::2222-:22\n"
+            "tcp::8080-:80"
+        )
+        self.network_hostfwd_edit.setFixedHeight(72)
+        network_form.addRow("Port forwarding:", self.network_hostfwd_edit)
+        network_hint = QLabel(
+            "NAT is the easiest option. Bridged mode may require a configured QEMU bridge adapter."
+        )
+        network_hint.setWordWrap(True)
+        network_hint.setStyleSheet("color: #718096; font-size: 11px;")
+        network_form.addRow("", network_hint)
+        self._update_network_fields()
+        network_layout.addWidget(network_box)
+
+        usb_box = QGroupBox("USB Passthrough")
+        usb_box_layout = QVBoxLayout(usb_box)
+        usb_hint = QLabel("Pick a device and click Add. Add as many as you need.")
+        usb_hint.setStyleSheet("color: gray; font-size: 11px;")
+        usb_box_layout.addWidget(usb_hint)
+
+        usb_pick_row = QHBoxLayout()
+        self.usb_combo = QComboBox()
+        usb_refresh_btn = QPushButton("Refresh")
+        usb_refresh_btn.clicked.connect(self._refresh_usb_devices)
+        usb_add_btn = QPushButton("Add")
+        usb_add_btn.clicked.connect(self._add_usb_device)
+        usb_pick_row.addWidget(self.usb_combo, stretch=1)
+        usb_pick_row.addWidget(usb_refresh_btn)
+        usb_pick_row.addWidget(usb_add_btn)
+        usb_box_layout.addLayout(usb_pick_row)
+
+        self.usb_selected_list = QListWidget()
+        self.usb_selected_list.setMaximumHeight(100)
+        usb_box_layout.addWidget(self.usb_selected_list)
+
+        usb_remove_btn = QPushButton("Remove selected")
+        usb_remove_btn.setObjectName("removeUsbButton")
+        usb_remove_btn.clicked.connect(self._remove_usb_device)
+        usb_box_layout.addWidget(usb_remove_btn)
+
+        self._usb_available = []  # list of (vendor_id, product_id, name)
+        for dev_key in vm.get("usb_devices", []):
+            item = QListWidgetItem(dev_key)
+            item.setData(Qt.UserRole, dev_key)
+            self.usb_selected_list.addItem(item)
+        self._refresh_usb_devices()
+        self._relabel_saved_usb_items()
+
+        usb_layout.addWidget(usb_box)
+
+        general_layout.addStretch()
+        system_layout.addStretch()
+        storage_layout.addStretch()
+        network_layout.addStretch()
+        usb_layout.addStretch()
+        tabs.addTab(general_page, "General")
+        tabs.addTab(system_page, "System")
+        tabs.addTab(storage_page, "Storage")
+        tabs.addTab(network_page, "Network")
+        tabs.addTab(usb_page, "USB")
+        layout.addWidget(tabs, stretch=1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._on_accept)
@@ -670,14 +1103,209 @@ class SettingsDialog(QDialog):
         self.vm["disk_format"] = self.disk_format_combo.currentText()
         self.vm["disk_bus"] = self.disk_bus_combo.currentText()
         self.vm["iso_path"] = self.iso_edit.text().strip()
-        self.vm["network"] = self.network_check.isChecked()
+        network_mode = self.network_mode_combo.currentData()
+        self.vm["network_mode"] = network_mode
+        self.vm["network"] = network_mode != "none"
+        self.vm["network_model"] = self.network_model_combo.currentText()
+        self.vm["network_mac"] = self.network_mac_edit.text().strip()
+        self.vm["network_ipv6"] = self.network_ipv6_check.isChecked()
+        self.vm["network_dns"] = self.network_dns_edit.text().strip()
+        self.vm["network_bridge"] = self.network_bridge_edit.text().strip()
+        self.vm["network_hostfwd"] = self.network_hostfwd_edit.toPlainText().strip()
+        self.vm["usb_devices"] = [
+            self.usb_selected_list.item(i).data(Qt.UserRole)
+            for i in range(self.usb_selected_list.count())
+        ]
         self.accept()
+
+    def _update_network_fields(self):
+        mode = self.network_mode_combo.currentData()
+        is_user = mode == "user"
+        is_bridge = mode == "bridge"
+        self.network_model_combo.setEnabled(mode != "none")
+        self.network_mac_edit.setEnabled(mode != "none")
+        self.network_ipv6_check.setEnabled(is_user)
+        self.network_dns_edit.setEnabled(is_user)
+        self.network_hostfwd_edit.setEnabled(is_user)
+        self.network_bridge_edit.setEnabled(is_bridge)
+
+    def _refresh_usb_devices(self):
+        self.usb_combo.clear()
+        self._usb_available = detect_usb_devices()
+        if not self._usb_available:
+            self.usb_combo.addItem("No USB devices detected", None)
+            return
+        for vendor_id, product_id, name in self._usb_available:
+            dev_key = f"{vendor_id}:{product_id}"
+            self.usb_combo.addItem(f"{name}  ({dev_key})", dev_key)
+
+    def _add_usb_device(self):
+        dev_key = self.usb_combo.currentData()
+        if not dev_key:
+            return
+        existing = {
+            self.usb_selected_list.item(i).data(Qt.UserRole)
+            for i in range(self.usb_selected_list.count())
+        }
+        if dev_key in existing:
+            return
+        label = self.usb_combo.currentText()
+        item = QListWidgetItem(label)
+        item.setData(Qt.UserRole, dev_key)
+        self.usb_selected_list.addItem(item)
+
+    def _remove_usb_device(self):
+        for item in self.usb_selected_list.selectedItems():
+            self.usb_selected_list.takeItem(self.usb_selected_list.row(item))
+
+    def _relabel_saved_usb_items(self):
+        name_by_key = {
+            f"{vendor_id}:{product_id}": name
+            for vendor_id, product_id, name in self._usb_available
+        }
+        for i in range(self.usb_selected_list.count()):
+            item = self.usb_selected_list.item(i)
+            dev_key = item.data(Qt.UserRole)
+            if dev_key in name_by_key:
+                item.setText(f"{name_by_key[dev_key]}  ({dev_key})")
 
 
 # ---------------------------------------------------------------------------
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QMainWindow, QDialog {
+            background: #f4f7fb;
+        }
+        QMainWindow {
+            color: #243b53;
+        }
+        QWidget {
+            color: #243b53;
+        }
+        QToolBar {
+            background: #ffffff;
+            border: 0;
+            border-bottom: 1px solid #d9e2ec;
+            spacing: 6px;
+            padding: 6px;
+        }
+        QToolButton {
+            color: #243b53;
+            padding: 6px 10px;
+            border-radius: 5px;
+        }
+        QToolButton:hover {
+            background: #e6f0ff;
+        }
+        QListWidget, QGroupBox, QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
+            background: #ffffff;
+            color: #243b53;
+            border: 1px solid #cbd5e1;
+            border-radius: 5px;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff;
+            color: #243b53;
+            selection-background-color: #2f80ed;
+            selection-color: #ffffff;
+            border: 1px solid #cbd5e1;
+        }
+        QComboBox::drop-down {
+            width: 26px;
+            border: 0;
+            border-left: 1px solid #d9e2ec;
+        }
+        QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled,
+        QPlainTextEdit:disabled {
+            background: #edf2f7;
+            color: #718096;
+        }
+        QListWidget {
+            padding: 4px;
+            outline: 0;
+        }
+        QListWidget::item {
+            padding: 8px;
+            border-radius: 4px;
+        }
+        QListWidget::item:selected {
+            background: #2f80ed;
+            color: #ffffff;
+        }
+        QGroupBox {
+            margin-top: 10px;
+            padding: 12px 8px 8px 8px;
+            font-weight: 600;
+        }
+        QTabWidget::pane {
+            border: 1px solid #d9e2ec;
+            border-radius: 6px;
+            background: #ffffff;
+            top: -1px;
+        }
+        QTabBar::tab {
+            background: #eaf0f6;
+            color: #486581;
+            padding: 8px 14px;
+            margin-right: 2px;
+            border: 1px solid transparent;
+        }
+        QTabBar::tab:selected {
+            background: #ffffff;
+            color: #1769c2;
+            border-color: #d9e2ec;
+            border-bottom-color: #ffffff;
+        }
+        QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
+            padding: 5px 7px;
+            min-height: 26px;
+        }
+        QCheckBox {
+            color: #243b53;
+            spacing: 7px;
+        }
+        QTabWidget {
+            color: #243b53;
+        }
+        QTabWidget QWidget {
+            background: #ffffff;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+            color: #243b53;
+        }
+        QPushButton {
+            background: #2f80ed;
+            color: white;
+            border: 0;
+            border-radius: 5px;
+            padding: 7px 13px;
+        }
+        QPushButton:hover {
+            background: #1769c2;
+        }
+        QPushButton#removeUsbButton {
+            background: #edf2f7;
+            color: #243b53;
+            border: 1px solid #bcccdc;
+        }
+        QPushButton#removeUsbButton:hover {
+            background: #ffe3e3;
+            color: #9b2c2c;
+            border-color: #fc8181;
+        }
+        QPushButton#removeUsbButton:pressed {
+            background: #feb2b2;
+        }
+        QStatusBar {
+            background: #eaf0f6;
+            color: #486581;
+        }
+    """)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
