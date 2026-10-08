@@ -1,52 +1,108 @@
-# Portable Virtual Machine
+# Portable Virtual Machine Manager (QemuManager)
 
-A VirtualBox-style graphical front end for a **portable QEMU install** on Windows.
-Instead of hand-typing `qemu-system-x86_64` command lines, manage your VMs from
-a simple GUI: create machines, tweak their settings, and start them with one click.
+A VirtualBox-style graphical front end for a portable QEMU install on Windows, Linux, and macOS. Instead of hand-typing complex `qemu-system-x86_64` command lines, you can manage your virtual machines from a clean, modern Qt-based GUI: create machines, tweak granular hardware settings, handle USB passthrough, and launch them with a single click. `Qemu.py` can be placed anywhere—whether on the desktop or in the Documents folder.
+
+---
 
 ## Features
 
-- VM list + detail panel (VirtualBox-style layout)
-- New VM wizard — name, OS type, RAM, CPU count, disk size, ISO
-- Per-VM settings dialog:
-  - Machine type (`q35` / `pc`), CPU model, RAM, CPU count
-  - Display backend (`gtk` / `sdl` / `none`) and video device (`std` / `virtio-vga` / `qxl` / `vmware`)
-  - Disk format (`qcow2` / `raw`) and bus (`virtio` / `sata`)
-  - ISO mounting
-  - NAT networking toggle
-  - Acceleration mode (`whpx` / `haxm` / `tcg`)
-- Start, Duplicate (with optional full disk clone), and Remove VMs from the toolbar
-- VM configs are saved as JSON in `%APPDATA%\QemuManager\vms.json`
-- Prints the exact `qemu-system-x86_64` / `qemu-img` command it runs, so you can
-  copy-paste it elsewhere or debug boot issues
+* **VirtualBox-Style Layout**: VM list sidebar paired with a comprehensive overview and detail panel.
+
+
+* **New VM Wizard**: Quickly set up a machine name, OS type, RAM, processor count, initial disk size, and ISO image.
+
+
+* **Granular Per-VM Settings (Multi-Tab Dialog)**:
+
+
+* **General**: Name and OS type.
+
+
+* **System**: RAM size, CPU count, machine type (`q35` / `pc`), extensive CPU models (`host`, `max`, `qemu64`, etc.), acceleration backend (`whpx`, `haxm`, `kvm`, `hvf`, `tcg`), display backend (`gtk`, `sdl`, `none`), and video device (`std`, `virtio-vga`, `qxl`, `vmware`).
+
+
+* **Storage**: Disk file path configuration, disk size, format (`qcow2`, `raw`), disk bus (`virtio`, `sata`), and ISO mounting/clearing.
+
+
+* **Network**: Connection modes (`user` / NAT, `bridge`, `none`), adapter models (`virtio`, `e1000`, `rtl8139`, `vmxnet3`), custom MAC address, IPv6 toggle, DNS server configuration, bridge name, and multi-line port forwarding (`hostfwd`) rules.
+
+
+* **USB Passthrough**: Automatic detection of host USB devices (including Windows drive-letter mapping for USB flash drives/external disks) and easy add/remove passthrough management.
+
+
+
+
+* **Toolbar Actions**: Start, Duplicate (with an option for a full disk clone or fresh disk), and Remove VMs.
+
+
+* **Persistent Storage**: VM configurations are automatically saved as JSON in `%APPDATA%\QemuManager\vms.json`, and virtual disks are stored under `%APPDATA%\QemuManager\disks\`.
+
+
+* **Command Debugging**: Prints the exact copy-pasteable `qemu-system-x86_64` and `qemu-img` commands to the console for easy debugging or external execution.
+
+
+
+---
 
 ## Requirements
 
-- Windows
-- Python 3.9+
-- A portable QEMU build from https://github.com/ganarcasas/qemu-portable
-- Python dependencies — see `requirements.txt`
+* **Python**: Version 3.9 or higher.
 
-## Setup
 
-1. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-2. Extract portable QEMU somewhere, e.g. `C:\qemu-portable-20241220`.
-3. Tell the app where QEMU lives, using **one** of:
-   - Environment variable: `set QEMU_DIR=C:\qemu-portable-20241220`
-   - Edit the `QEMU_DIR` default near the top of `Qemu.py`
-4. Run it:
-   ```
-   python Qemu.py
-   ```
+* **Python Dependencies**: PySide6 (`pip install PySide6`).
 
-The app looks for `qemu-system-x86_64.exe` and `qemu-img.exe` directly inside
-`QEMU_DIR`, or in any subfolder underneath it.
 
-## Notes
+* **Portable QEMU**: A portable QEMU build (such as [ganarcasas/qemu-portable](https://github.com/ganarcasas/qemu-portable)).
 
-- Disk images and app config are stored under `%APPDATA%\QemuManager\`.
-- This is open source — feel free to change paths, defaults, or add options
-  (e.g. more accelerators, snapshot support, additional disks).
+
+
+---
+
+## Setup & Installation
+
+1. **Install Dependencies**:
+```bash
+pip install PySide6
+
+```
+
+
+2. **Extract Portable QEMU**:
+Extract your portable QEMU build somewhere on your system (e.g., `C:\qemu-portable-20241220` or right next to the script in a folder named `qemu-portable`).
+
+
+3. **Configure QEMU Directory**:
+The application looks for `qemu-system-x86_64.exe` and `qemu-img.exe` automatically using the following priority:
+
+
+* **Environment Variable**: Set `QEMU_DIR` to your custom path:
+```cmd
+set QEMU_DIR=C:\path\to\qemu-portable
+
+```
+
+
+* **Local Folder**: A folder named `qemu-portable` placed in the same directory as the script or frozen executable.
+
+
+* **Fallback Path**: Defaults to `C:\qemu-portable-20241220`.
+
+
+
+
+4. **Run the Application**:
+```bash
+python Qemu.py
+
+```
+
+
+
+---
+
+## Notes & Open Source
+
+* Disk images and configuration files reside in `%APPDATA%\QemuManager\`.
+
+
+* This project is open source—feel free to adjust default parameters, modify execution paths, or extend accelerator support as needed.
